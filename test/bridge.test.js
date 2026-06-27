@@ -66,6 +66,20 @@ test('a non-2xx response is relayed as a JSON-RPC error carrying the request id'
   assert.match(parsed.error.message, /401/);
 });
 
+test('a pretty-printed (multi-line) upstream response is compacted to a single stdout line', async () => {
+  // The hosted /mcp endpoint pretty-prints JSON; MCP stdio framing forbids embedded
+  // newlines, so the bridge must collapse it to one line.
+  const pretty = '{\n  "jsonrpc": "2.0",\n  "id": 9,\n  "result": { "ok": true }\n}';
+  const fetchMock = async () => mockResponse({ status: 200, body: pretty });
+  const out = await forward('{"jsonrpc":"2.0","id":9,"method":"tools/list"}', {
+    baseUrl: 'https://x.test',
+    apiKey: 'k',
+    fetch: fetchMock,
+  });
+  assert.ok(!out.includes('\n'), 'output must not contain a newline');
+  assert.deepEqual(JSON.parse(out), { jsonrpc: '2.0', id: 9, result: { ok: true } });
+});
+
 test('loadConfig: --key overrides env, default base url, trailing slash trimmed', () => {
   assert.equal(loadConfig([], {}).baseUrl, 'https://api.numeratica.com');
   const cfg = loadConfig(['--key', 'flagkey'], { NUMERATICA_API_KEY: 'envkey', NUMERATICA_BASE_URL: 'https://h.test/' });

@@ -1,6 +1,6 @@
 {
   "name": "@numeratica/mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Thin stdio MCP bridge to the Numeratica financial-planning API — add retirement, tax, and planning tools to any MCP client with npx.",
   "type": "module",
   "bin": {

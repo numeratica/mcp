@@ -103,11 +103,26 @@ export async function forward(line, opts) {
 
   if (!res.ok) {
     if (isNotification) return null;
-    const detail = text ? `: ${text.slice(0, 500)}` : '';
+    const detail = text ? `: ${oneLine(text).slice(0, 500)}` : '';
     return jsonRpcError(id, -32000, `Numeratica API error (HTTP ${res.status})${detail}`);
   }
 
-  return text === '' ? null : text;
+  if (text === '') return null;
+  // MCP's stdio transport frames messages as single-line, newline-delimited JSON
+  // (a message MUST NOT contain embedded newlines). The hosted endpoint may
+  // pretty-print its JSON, so re-serialize compactly to guarantee one line.
+  try {
+    return JSON.stringify(JSON.parse(text));
+  } catch {
+    return oneLine(text);
+  }
+}
+
+// oneLine collapses any newlines/indentation into single spaces — a fallback for
+// non-JSON or unparseable bodies so we never emit a multi-line stdout frame.
+/** @param {string} s */
+function oneLine(s) {
+  return s.replace(/\s*\r?\n\s*/g, ' ').trim();
 }
 
 /**
