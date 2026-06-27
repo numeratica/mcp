@@ -1,0 +1,44 @@
+{
+  "name": "@numeratica/mcp",
+  "version": "0.1.0",
+  "description": "Thin stdio MCP bridge to the Numeratica financial-planning API — add retirement, tax, and planning tools to any MCP client with npx.",
+  "type": "module",
+  "bin": {
+    "numeratica-mcp": "bin/numeratica-mcp.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "numeratica",
+    "retirement",
+    "tax",
+    "finance",
+    "agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/numeratica/mcp.git"
+  },
+  "homepage": "https://docs.numeratica.com",
+  "bugs": {
+    "url": "https://github.com/numeratica/mcp/issues"
+  },
+  "license": "MIT",
+  "author": "Numeratica / Francis Townsend-Merino",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.6.0"
+  }
+}
