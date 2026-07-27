@@ -1,0 +1,66 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.numeratica/mcp",
+  "title": "Numeratica — financial planning calculations",
+  "description": "Deterministic US financial planning: retirement Monte Carlo, Roth conversion, RMD, tax, IRMAA, SS",
+  "version": "0.1.1",
+  "websiteUrl": "https://docs.numeratica.com",
+  "repository": {
+    "url": "https://github.com/numeratica/mcp",
+    "source": "github"
+  },
+  "icons": [
+    {
+      "src": "https://docs.numeratica.com/assets/favicon.svg",
+      "mimeType": "image/svg+xml"
+    },
+    {
+      "src": "https://docs.numeratica.com/assets/favicon-32.png",
+      "mimeType": "image/png",
+      "sizes": [
+        "32x32"
+      ]
+    }
+  ],
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@numeratica/mcp",
+      "version": "0.1.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "NUMERATICA_API_KEY",
+          "description": "Numeratica API key (nmr_sk_...). Free self-serve key at https://docs.numeratica.com/get-key",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        },
+        {
+          "name": "NUMERATICA_BASE_URL",
+          "description": "Override the API base URL. Defaults to https://api.numeratica.com; only needed for a staging or self-hosted deployment.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://api.numeratica.com/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer <your Numeratica API key>. Required to CALL a tool; initialize, tools/list and ping answer without it, so a client or registry can enumerate the catalogue before signing up.",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
