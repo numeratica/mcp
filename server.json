@@ -56,8 +56,8 @@
       "headers": [
         {
           "name": "Authorization",
-          "description": "Bearer <your Numeratica API key>. Required to CALL a tool; initialize, tools/list and ping answer without it, so a client or registry can enumerate the catalogue before signing up.",
-          "isRequired": false,
+          "description": "Bearer <your Numeratica API key>, from https://docs.numeratica.com/get-key. Required for every tools/call. Discovery (initialize, tools/list, ping) answers without it, so a registry can enumerate the catalogue, but a client should still collect the key at setup or the first tool call fails.",
+          "isRequired": true,
           "isSecret": true,
           "format": "string"
         }

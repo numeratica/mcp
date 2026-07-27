@@ -82,3 +82,25 @@ test('server.json declares the env vars the bridge actually reads', () => {
   assert.equal(key.isRequired, true);
   assert.equal(key.isSecret, true, 'the API key must be marked secret so clients do not log it');
 });
+
+test('both install paths agree that the API key is required', () => {
+  // isRequired drives whether a CLIENT PROMPTS for the value at setup — it does not
+  // gate the connection. Anonymous discovery works because the server permits it, and
+  // no manifest field can revoke that. So marking the remote's Authorization header
+  // optional bought nothing and cost a working first call: the client would skip the
+  // prompt, then every tools/call would come back isError with "missing API key".
+  //
+  // The two paths carry the SAME credential, so they must make the same claim about
+  // it. They disagreed once; this keeps them from drifting apart again.
+  const server = read('server.json');
+  const env = server.packages[0].environmentVariables.find((e) => e.name === 'NUMERATICA_API_KEY');
+  const header = server.remotes[0].headers.find((h) => h.name === 'Authorization');
+
+  assert.equal(header.isRequired, env.isRequired, 'stdio and remote disagree on whether the key is required');
+  assert.equal(header.isSecret, true, 'the bearer token must be marked secret');
+  assert.match(
+    header.description,
+    /tools\/list|discovery/i,
+    'the description must still explain that discovery is anonymous — that nuance now lives only here',
+  );
+});
