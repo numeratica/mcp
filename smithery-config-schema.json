@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "required": ["apiKey"],
+  "properties": {
+    "apiKey": {
+      "type": "string",
+      "title": "Numeratica API key",
+      "description": "Free self-serve key from https://docs.numeratica.com/get-key. Needed to run a calculation; browsing the tool list works without one.",
+      "x-to": { "header": "X-API-Key" }
+    }
+  }
+}
