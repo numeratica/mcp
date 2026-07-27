@@ -1,7 +1,21 @@
 name: Publish
 
-# Publishes @numeratica/mcp to npm when a version tag (e.g. v0.1.0) is pushed.
-# Requires an NPM_TOKEN repo secret (an automation token for the "numeratica" org).
+# Publishes @numeratica/mcp to npm AND the entry to the MCP Registry when a version
+# tag (e.g. v0.1.0) is pushed. Both happen in one job, in that order, because the
+# registry entry points at an npm version: publishing the listing first would
+# advertise a package that does not exist yet.
+#
+# Secrets:
+#   NPM_TOKEN        — automation token for the "numeratica" org
+#   MCP_PRIVATE_KEY  — Ed25519 private key (hex) whose public half is the
+#                      "v=MCPv1" TXT record on the numeratica.com apex.
+#
+# Why DNS auth and not `login github-oidc` (which needs no secret): OIDC is
+# GitHub-based auth, and the registry maps that to `io.github.<owner>/*` only. Our
+# namespace is `com.numeratica/mcp`, a DOMAIN namespace, so ownership has to be
+# proven against numeratica.com. The no-secret option for a domain namespace is
+# `login dns google-kms` with Application Default Credentials; that is the upgrade
+# path if this key should stop living in a repo secret.
 on:
   push:
     tags: ['v*']
@@ -19,8 +33,33 @@ jobs:
           node-version: 20
           registry-url: 'https://registry.npmjs.org'
       - run: npm ci
+
+      # The tag is a fourth copy of the version number, and it is the one nothing in
+      # the repo can see. Fail before publishing anything rather than shipping
+      # 0.1.1 under a v0.2.0 tag. (test/version-sync.test.js covers the other three.)
+      - name: Tag matches package.json version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG="$(node -p 'require("./package.json").version')"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG does not match package.json version $PKG"
+            exit 1
+          fi
+          echo "publishing $PKG"
+
       - run: npm run typecheck
-      - run: npm test
+      - run: npm test # includes the server.json <-> package.json version sync check
       - run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      ### MCP Registry — must run after npm publish (see header)
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+            | tar xz mcp-publisher
+      - name: Authenticate to the MCP Registry
+        run: ./mcp-publisher login dns --domain numeratica.com --private-key "${{ secrets.MCP_PRIVATE_KEY }}"
+      - name: Publish to the MCP Registry
+        run: ./mcp-publisher publish

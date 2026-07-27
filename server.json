@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.numeratica/mcp",
+  "name": "com.numeratica/mcp",
   "title": "Numeratica — financial planning calculations",
   "description": "Deterministic US financial planning: retirement Monte Carlo, Roth conversion, RMD, tax, IRMAA, SS",
   "version": "0.1.1",
