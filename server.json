@@ -3,7 +3,7 @@
   "name": "com.numeratica/mcp",
   "title": "Numeratica — financial planning calculations",
   "description": "Deterministic US financial planning: retirement Monte Carlo, Roth conversion, RMD, tax, IRMAA, SS",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "websiteUrl": "https://docs.numeratica.com",
   "repository": {
     "url": "https://github.com/numeratica/mcp",
@@ -26,7 +26,7 @@
     {
       "registryType": "npm",
       "identifier": "@numeratica/mcp",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "transport": {
         "type": "stdio"
       },
@@ -41,6 +41,13 @@
         {
           "name": "NUMERATICA_BASE_URL",
           "description": "Override the API base URL. Defaults to https://api.numeratica.com; only needed for a staging or self-hosted deployment.",
+          "isRequired": false,
+          "isSecret": false,
+          "format": "string"
+        },
+        {
+          "name": "NUMERATICA_TIMEOUT_MS",
+          "description": "Per-request timeout in milliseconds (default 120000, minimum 1000). Raise it for long-horizon Monte Carlo runs.",
           "isRequired": false,
           "isSecret": false,
           "format": "string"

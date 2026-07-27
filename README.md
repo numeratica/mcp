@@ -8,7 +8,7 @@ A thin [MCP](https://modelcontextprotocol.io) bridge that connects any MCP clien
 
 This package is a **transport bridge, nothing more**. It reads JSON-RPC from stdin and forwards each message to the hosted `POST /mcp` endpoint with your API key as a bearer token, then writes the response back to stdout. The tool list and all results come straight from the API — so the bridge always stays in sync and ships no calculation logic of its own. Your key is sent only in the `Authorization` header and **is never logged**.
 
-- **Zero runtime dependencies** (Node ≥ 18 built-in `fetch` + `node:readline`).
+- **Zero runtime dependencies** (Node ≥ 20 built-in `fetch` + `node:readline`).
 - Open source (MIT). The interesting part is the API; this is just the wire.
 
 ## Install
@@ -56,7 +56,11 @@ Restart the client and the Numeratica tools appear. Try: *"Run a retirement Mont
 | `NUMERATICA_API_KEY` | **yes** | — | Your key. Get one free at [docs.numeratica.com](https://docs.numeratica.com). Never logged. |
 | `NUMERATICA_BASE_URL` | no | `https://api.numeratica.com` | Override the API base (e.g. for testing). |
 
-You can also pass the key with `--key <value>` instead of the env var.
+You can also pass the key with `--key <value>` or `--key=<value>` instead of the env
+var, but **prefer `NUMERATICA_API_KEY`**: a key on the command line is visible to
+`ps` for every user on the machine, lands in shell history, and is stored verbatim
+in MCP client config files that people routinely paste into issue reports. For a
+non-env option that avoids all three, use `--key-file <path>`.
 
 ## Links
 
