@@ -45,7 +45,8 @@
           "isSecret": false,
           "format": "string"
         }
-      ]
+      ],
+      "runtimeHint": "npx"
     }
   ],
   "remotes": [
