@@ -47,6 +47,23 @@ test('server.json, its npm package entry, and package.json all carry the same ve
   );
 });
 
+test('package.json mcpName matches the registry namespace', () => {
+  // The MCP Registry refuses to publish unless the npm package names the namespace
+  // back — it fetches the PUBLISHED tarball and reads package.json .mcpName, which is
+  // how it knows @numeratica/mcp is really ours and not someone squatting the listing.
+  //
+  // The trap: it validates the tarball, not the working tree, so a mismatch cannot be
+  // fixed in place — it needs a fresh npm release. That is why this is a test and not
+  // something we check at publish time, when the only remedy is another version bump.
+  const pkg = read('package.json');
+  const server = read('server.json');
+  assert.equal(
+    pkg.mcpName,
+    server.name,
+    'package.json .mcpName must equal server.json .name, or the registry rejects the publish',
+  );
+});
+
 test('server.json declares the env vars the bridge actually reads', () => {
   const server = read('server.json');
   const bridge = readFileSync(fileURLToPath(new URL('../src/bridge.js', import.meta.url)), 'utf8');
