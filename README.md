@@ -15,9 +15,34 @@ This package is a **transport bridge, nothing more**. It reads JSON-RPC from std
 
 No install needed — your MCP client runs it on demand with `npx`. (You can also `npm i -g @numeratica/mcp` to get the `numeratica-mcp` command.)
 
-### Claude Desktop
+### Step 1 — look around, no key needed
 
-Add to `claude_desktop_config.json` (Settings → Developer → Edit Config):
+Start here. This config needs no signup and no key:
+
+```json
+{
+  "mcpServers": {
+    "numeratica": {
+      "command": "npx",
+      "args": ["-y", "@numeratica/mcp"]
+    }
+  }
+}
+```
+
+Put it in `claude_desktop_config.json` (Claude Desktop: Settings → Developer → Edit
+Config) or `~/.cursor/mcp.json` (Cursor, or a project `.cursor/mcp.json`), then
+restart the client. All 76 tools appear, and you can ask what's available — *"What
+Numeratica tools do you have?"*
+
+Without a key the bridge runs in **discovery-only mode**: browsing the catalogue
+works, running a calculation returns a message telling you to add a key. That's the
+intended state, not a failure.
+
+### Step 2 — add a key to run calculations
+
+Get a free key at [docs.numeratica.com/get-key](https://docs.numeratica.com/get-key),
+then add one line:
 
 ```json
 {
@@ -31,29 +56,13 @@ Add to `claude_desktop_config.json` (Settings → Developer → Edit Config):
 }
 ```
 
-### Cursor
-
-Add to `~/.cursor/mcp.json` (or a project `.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "numeratica": {
-      "command": "npx",
-      "args": ["-y", "@numeratica/mcp"],
-      "env": { "NUMERATICA_API_KEY": "nmr_sk_your_key_here" }
-    }
-  }
-}
-```
-
-Restart the client and the Numeratica tools appear. Try: *"Run a retirement Monte Carlo for a 40-year-old retiring at 65."*
+Restart, and the tools are live. Try: *"Run a retirement Monte Carlo for a 40-year-old retiring at 65."*
 
 ## Configuration
 
 | Variable | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `NUMERATICA_API_KEY` | **yes** | — | Your key. Get one free at [docs.numeratica.com](https://docs.numeratica.com). Never logged. |
+| `NUMERATICA_API_KEY` | to run calculations | — | Your key. Get one free at [docs.numeratica.com/get-key](https://docs.numeratica.com/get-key). Never logged. Omit it to browse the catalogue in discovery-only mode. |
 | `NUMERATICA_BASE_URL` | no | `https://api.numeratica.com` | Override the API base (e.g. for testing). |
 
 You can also pass the key with `--key <value>` or `--key=<value>` instead of the env
