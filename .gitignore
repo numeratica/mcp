@@ -3,3 +3,8 @@ dist/
 *.log
 .DS_Store
 .env
+# Scratch/transfer artifacts. _to_delete/ got swept into a commit by `git add -A`;
+# the *.local suffix is the convention for anything staged for hand-off, so ignore
+# both rather than relying on remembering to path-scope the add.
+_to_delete/
+*.local
