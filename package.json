@@ -1,7 +1,7 @@
 {
   "name": "@numeratica/mcp",
-  "version": "0.1.3",
-  "description": "Thin stdio MCP bridge to the Numeratica financial-planning API \u2014 add retirement, tax, and planning tools to any MCP client with npx.",
+  "version": "0.1.4",
+  "description": "Thin stdio MCP bridge to the Numeratica financial-planning API — add retirement, tax, and planning tools to any MCP client with npx.",
   "mcpName": "com.numeratica/mcp",
   "type": "module",
   "bin": {
@@ -35,12 +35,12 @@
   "license": "MIT",
   "author": "Numeratica / Francis Townsend-Merino",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
     "test": "node --test",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "devDependencies": {
-    "@types/node": "^20.14.0",
+    "@types/node": "^24.0.0",
     "typescript": "^5.6.0"
   }
 }

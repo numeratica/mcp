@@ -1,0 +1,44 @@
+fix: resolve all 16 audit findings — the bridge is a client, not a pipe
+
+The bridge was written as a pipe, but the thing on either end is a protocol with
+a session, a content-negotiation contract, and concurrent in-flight requests. The
+body is still forwarded byte-for-byte — that invariant is the design — but the
+transport around it now honours those three.
+
+High:
+- #1 concurrent dispatch with an inflight ceiling of 8 and an EOF drain. A 40s
+  Monte Carlo no longer delays a 50ms bracket lookup behind it by 40 seconds.
+- #2 AbortController + NUMERATICA_TIMEOUT_MS. Node's fetch has no default
+  timeout, so a slept laptop or dropped VPN wedged the process permanently with
+  stdin held open — the one failure shape no client heuristic detects.
+- #3 Accept now lists text/event-stream as the spec requires. This only worked
+  because our own server is lenient; a compliant one may answer 406.
+- #4 MCP-Session-Id captured and echoed, plus the 404 re-initialize path.
+- #5 MCP-Protocol-Version sent, taken from the negotiated initialize result.
+- #6 SSE bodies parsed per frame. They previously failed JSON.parse and fell
+  through to oneLine, which faithfully emitted "event: message data: {...}" to
+  stdout — silent on this side, which is why it looked like it worked.
+
+Medium/low: #7 exitCode instead of exit() (async stdout is not flushed by
+exit()); #8 retry on 429/502/503/504 honouring Retry-After, inside the timeout
+budget; #9 backpressure-aware serialized writer; #10 --key-file plus a README
+caveat, since a key in argv is visible to ps; #11 --key=value, the form that
+silently fell through to "NUMERATICA_API_KEY is required" while the key was on
+the command line; #12 DELETE the session on shutdown; #13 truncate on code
+points, not UTF-16 units; #14 reject batches explicitly; #15 comment pinning why
+id===undefined is the notification test.
+
+#16: 8 tests -> 40, and mockResponse now carries real headers, which is what made
+#4 and #5 invisible before. CI matrices 20/22/24 and the engines floor moves to
+20 (18 is EOL and was never exercised). prepublishOnly gates publish on green.
+
+Each fix was verified by reverting it and confirming the suite fails. That found
+a bug in one of the new tests: #13's fixture used 600 emoji, and a 500-unit cut
+across two-unit characters lands exactly on a pair boundary, so it never split
+one. Fixed with a one-character offset.
+
+Smoke-tested against production: initialize negotiates 2025-11-25, tools/list
+returns 76 tools, every frame single-line, clean exit.
+
+The audit is committed alongside, marked resolved.
+

@@ -30,15 +30,16 @@ const SHUTDOWN_TIMEOUT_MS = 2_000;
 // unbounded sockets. High enough that a normal multi-tool turn never queues.
 const MAX_INFLIGHT = 8;
 
-// Transient upstream failures worth one more attempt. Everything else — including
-// every other 4xx — is terminal: retrying a 400 or a 401 just wastes the deadline.
-const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
+// Methods with no server-side effect, so replaying one after a gateway error is
+// free. Everything else is replayed only when the server has told us it did not
+// process the request at all (see isRetryable).
+const REPLAY_SAFE_METHODS = new Set(['tools/list', 'ping', 'resources/list', 'prompts/list']);
 const MAX_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 30_000;
 
-// Sent until `initialize` tells us what the client and server actually negotiated.
-// The spec says a server that receives NO version header should assume 2025-03-26,
-// so sending a recent version is strictly better than sending nothing.
+// Sent on requests AFTER initialize, until the negotiated version is known. Not on
+// initialize itself — see buildHeaders for why "a version beats no version" is
+// exactly backwards for that one request.
 const FALLBACK_PROTOCOL_VERSION = '2025-06-18';
 
 /**
@@ -48,6 +49,7 @@ const FALLBACK_PROTOCOL_VERSION = '2025-06-18';
  * @property {number} timeoutMs
  * @property {string[]} unknownFlags
  * @property {string|undefined} configError
+ * @property {boolean} keyFromArgv
  */
 
 /**
@@ -73,12 +75,13 @@ export function loadConfig(argv, env, readFile = (p) => readFileSync(p, 'utf8'))
   let apiKey = env.NUMERATICA_API_KEY;
   let keyFile;
   let configError;
+  let keyFromArgv = false;
   const unknownFlags = [];
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--key' && argv[i + 1] !== undefined) apiKey = argv[++i];
-    else if (a.startsWith('--key=')) apiKey = a.slice('--key='.length);
+    if (a === '--key' && argv[i + 1] !== undefined) (apiKey = argv[++i]), (keyFromArgv = true);
+    else if (a.startsWith('--key=')) (apiKey = a.slice('--key='.length)), (keyFromArgv = true);
     else if (a === '--key-file' && argv[i + 1] !== undefined) keyFile = argv[++i];
     else if (a.startsWith('--key-file=')) keyFile = a.slice('--key-file='.length);
     else if (a.startsWith('-')) unknownFlags.push(a);
@@ -102,7 +105,7 @@ export function loadConfig(argv, env, readFile = (p) => readFileSync(p, 'utf8'))
     else configError = `NUMERATICA_TIMEOUT_MS must be a number >= ${MIN_TIMEOUT_MS} (got ${rawTimeout})`;
   }
 
-  return { apiKey, baseUrl, timeoutMs, unknownFlags, configError };
+  return { apiKey, baseUrl, timeoutMs, unknownFlags, configError, keyFromArgv };
 }
 
 /**
@@ -143,18 +146,48 @@ function jsonRpcError(id, code, message) {
  *
  * @param {{ apiKey: string }} opts
  * @param {Session} session
+ * @param {string} [method]
  * @returns {Record<string,string>}
  */
-function buildHeaders(opts, session) {
+function buildHeaders(opts, session, method) {
   /** @type {Record<string,string>} */
   const headers = {
     Authorization: `Bearer ${opts.apiKey}`,
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
-    'MCP-Protocol-Version': session.protocolVersion || FALLBACK_PROTOCOL_VERSION,
   };
+  // The spec puts MCP-Protocol-Version on requests SUBSEQUENT to initialization.
+  // Sending a guess on `initialize` itself is not merely premature, it is worse
+  // than sending nothing: a server that speaks only 2025-03-26 must answer 400 for
+  // a version it does not support, whereas with no header it is told to ASSUME
+  // 2025-03-26 and the handshake succeeds. Once initialize tells us what was
+  // actually negotiated, send that on everything.
+  if (method !== 'initialize' || session.protocolVersion) {
+    headers['MCP-Protocol-Version'] = session.protocolVersion || FALLBACK_PROTOCOL_VERSION;
+  }
   if (session.id) headers['MCP-Session-Id'] = session.id;
   return headers;
+}
+
+/**
+ * Whether an upstream failure is worth another attempt.
+ *
+ * 429 and 503 mean the server did NOT process the request — replaying is free.
+ * 502 and 504 are gateway errors, where the request may well have been delivered
+ * and only the response lost: replaying a `tools/call` double-meters the usage
+ * event, and replaying `initialize` mints server-side sessions that the extra
+ * attempts then orphan — precisely the leak endSession exists to prevent. So
+ * those two are replayed only for methods with no server-side effect.
+ *
+ * @param {number} status
+ * @param {string} method
+ * @param {number} attempt  1-based
+ */
+function isRetryable(status, method, attempt) {
+  if (attempt >= MAX_ATTEMPTS) return false;
+  if (status === 429 || status === 503) return true;
+  if (status === 502 || status === 504) return REPLAY_SAFE_METHODS.has(method);
+  return false;
 }
 
 /**
@@ -166,7 +199,7 @@ function buildHeaders(opts, session) {
  * @param {number} now
  * @returns {number}
  */
-function retryDelayMs(res, attempt, now) {
+export function retryDelayMs(res, attempt, now) {
   const raw = res?.headers?.get?.('retry-after');
   if (raw) {
     const secs = Number(raw);
@@ -201,9 +234,12 @@ function sleep(ms) {
  */
 export function parseSSE(text) {
   const payloads = [];
-  for (const frame of text.split(/\r?\n\r?\n/)) {
+  // SSE line terminators are CRLF, LF *or* a bare CR — all three are legal. Splitting
+  // on /\r?\n/ alone silently yielded zero payloads for a bare-CR stream, which is
+  // indistinguishable from "the server said nothing".
+  for (const frame of text.split(/(?:\r\n|\r|\n){2}/)) {
     const data = frame
-      .split(/\r?\n/)
+      .split(/\r\n|\r|\n/)
       .filter((l) => l.startsWith('data:'))
       .map((l) => l.slice('data:'.length).replace(/^ /, ''))
       .join('\n');
@@ -312,6 +348,8 @@ export async function forward(line, opts) {
 
   const deadline = now() + timeoutMs;
   let res;
+  let contentType = '';
+  let text = '';
 
   for (let attempt = 1; ; attempt++) {
     const remaining = deadline - now();
@@ -321,15 +359,46 @@ export async function forward(line, opts) {
     // a slept laptop, a dropped VPN, a load balancer holding the socket — hangs for
     // the OS TCP timeout while the process stays alive holding stdin open, which is
     // the one failure shape no client heuristic detects.
+    //
+    // The timer MUST outlive the body read. fetch() settles as soon as response
+    // HEADERS arrive, so clearing the timer at that point left res.text() entirely
+    // unbounded: a server that sends headers and then stalls the body hung forever
+    // despite a stated timeout — the same wedge, one phase later, and the phase a
+    // slept laptop actually leaves you in. One controller covers the whole attempt.
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), remaining);
+    let retryWait = -1;
     try {
       res = await opts.fetch(`${opts.baseUrl}/mcp`, {
         method: 'POST',
-        headers: buildHeaders(opts, session),
+        headers: buildHeaders(opts, session, method),
         body,
         signal: ac.signal,
       });
+
+      // A server MAY assign a session id at initialization; if it does, the client
+      // MUST echo it on every subsequent request or a stateful server answers 400.
+      const sid = res?.headers?.get?.('mcp-session-id');
+      if (sid) session.id = sid;
+
+      if (isRetryable(res.status, method, attempt)) {
+        const wait = retryDelayMs(res, attempt, now());
+        // The retry budget must stay inside the timeout.
+        if (now() + wait < deadline) {
+          retryWait = wait;
+          try {
+            await res.body?.cancel?.(); // discard the unread body before reissuing
+          } catch {
+            // best effort
+          }
+        }
+      }
+
+      // Notification acks (202/204) carry no body — nothing to read.
+      if (retryWait < 0 && res.status !== 202 && res.status !== 204) {
+        contentType = res.headers?.get?.('content-type') || '';
+        text = (await res.text()).trim(); // still under the timer, by design
+      }
     } catch (err) {
       if (isNotification) return [];
       const name = err instanceof Error ? err.name : '';
@@ -340,29 +409,11 @@ export async function forward(line, opts) {
       clearTimeout(timer);
     }
 
-    // A server MAY assign a session id at initialization; if it does, the client
-    // MUST echo it on every subsequent request or a stateful server answers 400.
-    const sid = res?.headers?.get?.('mcp-session-id');
-    if (sid) session.id = sid;
-
-    const shouldRetry = RETRYABLE_STATUS.has(res.status) && attempt < MAX_ATTEMPTS;
-    if (!shouldRetry) break;
-
-    const wait = retryDelayMs(res, attempt, now());
-    if (now() + wait >= deadline) break; // the retry budget must stay inside the timeout
-    try {
-      await res.body?.cancel?.(); // discard the unread body before reissuing
-    } catch {
-      // best effort
-    }
-    await sleep(wait);
+    if (retryWait < 0) break;
+    await sleep(retryWait);
   }
 
-  // Notification acks (202/204) carry no body — write nothing.
   if (res.status === 202 || res.status === 204) return [];
-
-  const contentType = res.headers?.get?.('content-type') || '';
-  const text = (await res.text()).trim();
 
   if (!res.ok) {
     // Per the spec, a 404 on a request carrying a session id means the session
@@ -381,6 +432,12 @@ export async function forward(line, opts) {
   // pretty-print its JSON, so re-serialize compactly to guarantee one line.
   if (/^text\/event-stream/i.test(contentType)) {
     const payloads = parseSSE(text);
+    // A body labelled SSE that yields no data payload — keepalive comments only, or
+    // a proxy mislabelling plain JSON. Returning [] strands a request that carried
+    // an id: the client waits forever for a response the server did send. That is
+    // WORSE than the corrupt frame this branch was added to prevent, because the old
+    // code at least emitted something. Treat it as one message.
+    if (payloads.length === 0) return isNotification ? [] : [compact(text)];
     for (const p of payloads) captureProtocolVersion(p, method, session);
     return payloads.map(compact);
   }
@@ -426,12 +483,25 @@ export async function endSession(opts, session) {
  * back. Awaiting each in turn meant a 40-second Monte Carlo delayed a 50 ms
  * bracket lookup behind it by the full 40 seconds.
  *
- * @param {{ stdin: NodeJS.ReadableStream, write: (s: string) => void|Promise<void>, fetch: typeof globalThis.fetch, baseUrl: string, apiKey: string, timeoutMs?: number, session?: Session, maxInflight?: number }} opts
+ * @param {{ stdin: NodeJS.ReadableStream, write: (s: string) => void|Promise<void>, fetch: typeof globalThis.fetch, baseUrl: string, apiKey: string, timeoutMs?: number, session?: Session, maxInflight?: number, onError?: (e: unknown) => void }} opts
  * @returns {Promise<Session>}
  */
 export async function run(opts) {
   const session = opts.session ?? {};
-  const limit = opts.maxInflight ?? MAX_INFLIGHT;
+  // Math.max guards an explicit 0, which ?? would happily accept: `while (0 >= 0)`
+  // races an empty Set, i.e. a promise that never settles — a wedge, in the code
+  // that exists to prevent wedges.
+  const limit = Math.max(1, opts.maxInflight ?? MAX_INFLIGHT);
+  const onError = opts.onError ?? ((/** @type {unknown} */ e) => {
+    // Swallowing to nothing hides an EPIPE on stdout. stderr is safe: the stdio
+    // transport only reserves stdout.
+    const msg = e instanceof Error ? e.message : String(e);
+    try {
+      process.stderr.write(`numeratica-mcp: response write failed: ${msg}\n`);
+    } catch {
+      // stderr is gone too; there is nowhere left to report.
+    }
+  });
   const rl = createInterface({ input: opts.stdin, crlfDelay: Infinity });
   /** @type {Set<Promise<void>>} */
   const inflight = new Set();
@@ -444,9 +514,7 @@ export async function run(opts) {
         // across responses order is free, which is what ids are for.
         for (const l of lines) await opts.write(l);
       })
-      .catch(() => {
-        // A failure here must not reject the drain below and skip the rest.
-      })
+      .catch(onError) // must not reject the drain below — but must not vanish either
       .finally(() => {
         inflight.delete(p);
       });
@@ -491,6 +559,15 @@ export async function main() {
     return;
   }
 
+  // The README documents the hazard, but a warning where it actually happens is
+  // what reaches someone who copied a config from a blog post: a key in argv is
+  // readable by `ps` for every user on the box and lands in shell history.
+  if (config.keyFromArgv) {
+    process.stderr.write(
+      'numeratica-mcp: warning: --key exposes your API key in the process list; prefer NUMERATICA_API_KEY or --key-file\n',
+    );
+  }
+
   /** @type {Session} */
   const session = {};
   const opts = {
@@ -505,11 +582,20 @@ export async function main() {
 
   // Ending stdin makes run() resolve, which drains in-flight writes and then
   // terminates the session — rather than exiting hard and truncating stdout.
+  //
+  // push(null), NOT destroy(): destroy() emits 'close', not 'end', and a readline
+  // async iterator does not terminate on close. So the loop never ended, run()
+  // never resolved, and the DELETE never fired — while registering this handler at
+  // all suppressed Node's default SIGINT termination, so Ctrl-C hung a process
+  // that used to exit. push(null) ends the stream the way the iterator expects.
   let closing = false;
   const shutdown = () => {
     if (closing) return;
     closing = true;
-    process.stdin.destroy();
+    process.stdin.push(null);
+    // A wedged upstream must not hold the exit past the shutdown budget. unref'd so
+    // it never keeps an otherwise-idle process alive.
+    setTimeout(() => process.exit(0), SHUTDOWN_TIMEOUT_MS).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

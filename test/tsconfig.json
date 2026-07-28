@@ -1,0 +1,8 @@
+{
+  "//": "Tests are typechecked too — prepublishOnly used to gate on a typecheck that never looked at test/. Implicit any is relaxed here because the fetch mocks are deliberately partial; everything else (strictNullChecks, checkJs) still applies.",
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noImplicitAny": false
+  },
+  "include": ["."]
+}

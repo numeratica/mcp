@@ -63,3 +63,25 @@ jobs:
         run: ./mcp-publisher login dns --domain numeratica.com --private-key "${{ secrets.MCP_PRIVATE_KEY }}"
       - name: Publish to the MCP Registry
         run: ./mcp-publisher publish
+
+      # version-sync.test.js pins the FILES to each other. It cannot see the thing
+      # that actually breaks an install: the two PUBLISHED artifacts disagreeing. If
+      # npm ships and the registry step fails, the listing points at a version that
+      # is not there — and nothing in the repo would notice.
+      - name: Verify both published artifacts agree
+        run: |
+          VERSION="$(node -p 'require("./package.json").version')"
+          for i in 1 2 3 4 5; do
+            NPM="$(curl -fsSL https://registry.npmjs.org/@numeratica/mcp | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8"))["dist-tags"].latest')"
+            REG="$(curl -fsSL 'https://registry.modelcontextprotocol.io/v0/servers?search=com.numeratica' \
+              | node -p 'const d=JSON.parse(require("fs").readFileSync(0,"utf8"));
+                         const s=(d.servers||[]).map(x=>x.server||x).find(x=>x.version==="'"$VERSION"'");
+                         s ? s.packages.find(p=>p.registryType==="npm").version : "absent"')"
+            echo "attempt $i: package.json=$VERSION npm=$NPM registry-npm-pointer=$REG"
+            if [ "$NPM" = "$VERSION" ] && [ "$REG" = "$VERSION" ]; then
+              echo "published artifacts agree at $VERSION"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::published artifacts disagree — npm=$NPM registry=$REG expected=$VERSION"
+          exit 1

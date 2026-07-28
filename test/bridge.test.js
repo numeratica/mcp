@@ -1,23 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable, Writable } from 'node:stream';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { forward, run, loadConfig, validateConfig, parseSSE, endSession, makeWriter } from '../src/bridge.js';
+import { readFileSync } from 'node:fs';
+import { forward, run, loadConfig, validateConfig, parseSSE, endSession, makeWriter, retryDelayMs } from '../src/bridge.js';
 
 /**
  * Minimal stand-in for a fetch Response.
  * `headers` is real: without it the session-id and protocol-version round trips
  * are invisible to the suite, which is precisely how they went missing.
+ *
+ * Cast rather than a full Response: only the handful of members `forward` touches
+ * are modelled, and a faithful Response would obscure which ones those are.
+ * @returns {Response}
  */
 function mockResponse({ status = 200, body = '', headers = {} } = {}) {
-  return {
+  return /** @type {any} */ ({
     status,
     ok: status >= 200 && status < 300,
     headers: new Headers(headers),
     text: async () => body,
     body: { cancel: async () => {} },
-  };
+  });
 }
 
 const BASE = { baseUrl: 'https://api.example.com', apiKey: 'sek_test' };
@@ -25,8 +30,8 @@ const BASE = { baseUrl: 'https://api.example.com', apiKey: 'sek_test' };
 // --- forwarding basics -------------------------------------------------------
 
 test('forwards a tools/call to /mcp with the Bearer header and returns the response', async () => {
-  let seenUrl;
-  let seenInit;
+  let seenUrl = /** @type {any} */ (null);
+  let seenInit = /** @type {any} */ (null);
   const fetchMock = async (url, init) => {
     seenUrl = url;
     seenInit = init;
@@ -48,7 +53,7 @@ test('Accept lists both application/json and text/event-stream', async () => {
   // The spec: "The client MUST include an Accept header, listing both
   // application/json and text/event-stream". A compliant server may answer 406
   // otherwise; sending only application/json worked because ours is lenient.
-  let seen;
+  let seen = /** @type {any} */ (null);
   const fetchMock = async (_url, init) => {
     seen = init.headers.Accept;
     return mockResponse({ body: '{"jsonrpc":"2.0","id":1,"result":{}}' });
@@ -120,7 +125,7 @@ test('two requests are in flight at once — a slow call does not block a fast o
   const stdin = Readable.from([
     '{"jsonrpc":"2.0","id":1,"method":"tools/call"}\n{"jsonrpc":"2.0","id":2,"method":"tools/call"}\n',
   ]);
-  await run({ stdin, write: (s) => writes.push(s), fetch: fetchMock, ...BASE });
+  await run({ stdin, write: (s) => void writes.push(s), fetch: fetchMock, ...BASE });
 
   assert.equal(maxActive, 2, 'both requests should be in flight together');
   assert.equal(writes.length, 2);
@@ -140,9 +145,9 @@ test('maxInflight caps concurrent upstream requests', async () => {
   };
   const lines = Array.from({ length: 8 }, (_, i) => `{"jsonrpc":"2.0","id":${i},"method":"ping"}`).join('\n');
   const writes = [];
-  await run({ stdin: Readable.from([lines + '\n']), write: (s) => writes.push(s), fetch: fetchMock, ...BASE, maxInflight: 2 });
+  await run({ stdin: Readable.from([lines + '\n']), write: (s) => void writes.push(s), fetch: fetchMock, ...BASE, maxInflight: 2 });
   assert.equal(writes.length, 8);
-  assert.ok(maxActive <= 2, `expected <= 2 concurrent, saw ${maxActive}`);
+  assert.equal(maxActive, 2, 'must reach the cap exactly — <= 2 also passes when serial');
 });
 
 test('a hung request times out as a JSON-RPC error instead of wedging forever', async () => {
@@ -247,7 +252,7 @@ test('the negotiated protocolVersion is captured and sent on later requests', as
   await forward('{"jsonrpc":"2.0","id":1,"method":"initialize"}', { ...BASE, fetch: fetchMock, session });
   await forward('{"jsonrpc":"2.0","id":2,"method":"tools/list"}', { ...BASE, fetch: fetchMock, session });
 
-  assert.ok(seen[0], 'a version must be sent even before initialize resolves');
+  assert.equal(seen[0], undefined, 'no version guess on initialize itself');
   assert.equal(seen[1], '2025-11-25', 'after initialize, send what was negotiated');
 });
 
@@ -310,7 +315,7 @@ test('a multi-frame SSE response keeps its order through run()', async () => {
   const writes = [];
   await run({
     stdin: Readable.from(['{"jsonrpc":"2.0","id":1,"method":"tools/call"}\n']),
-    write: (s) => writes.push(s),
+    write: (s) => void writes.push(s),
     fetch: fetchMock,
     ...BASE,
   });
@@ -463,9 +468,16 @@ test('the bin exits non-zero with a clear message and no stdout when the key is 
   assert.match(r.stderr, /NUMERATICA_API_KEY is required/);
 });
 
-test('the bin exits 0 and flushes a large final response (no truncation at exit)', () => {
-  // process.exit() does not flush async stdout; a large tail was lost. The bin must
-  // set exitCode and let the event loop drain.
+test('a large final response survives shutdown intact (writer drain, end to end)', () => {
+  // NAMED HONESTLY, second time around. This was called a process.exit() test, but it
+  // passes with process.exit(0) restored — because makeWriter already awaits 'drain'
+  // before run() resolves, so nothing is ever pending by the time exit is reached.
+  // What it actually proves is the backpressure-aware writer, end to end.
+  //
+  // exitCode is still the right call (it costs nothing and does not depend on the
+  // writer staying correct), but it is defence in depth here, not the load-bearing
+  // guarantee — and a test that cannot fail is worse than no test, because it makes
+  // a revert-check look thorough when it isn't.
   const src = fileURLToPath(new URL('../src/bridge.js', import.meta.url));
   const script = `
     globalThis.fetch = async () => ({
@@ -485,4 +497,225 @@ test('the bin exits 0 and flushes a large final response (no truncation at exit)
   assert.equal(r.status, 0, r.stderr);
   const line = r.stdout.trim();
   assert.equal(JSON.parse(line).result.big.length, 200_000, 'the full response must survive exit');
+});
+
+// --- second-round findings ---------------------------------------------------
+
+test('a stalled response BODY times out — not just a stalled connection', async () => {
+  // fetch() settles when HEADERS arrive. Clearing the abort timer there left
+  // res.text() unbounded, so a server that answers headers and then stops sending
+  // hung forever at a stated timeout. Both earlier timeout tests used a fetch that
+  // never resolved at all, so neither could see this.
+  const stalledBody = (_url, init) =>
+    /** @type {any} */ (Promise.resolve({
+      status: 200,
+      ok: true,
+      headers: new Headers({ 'content-type': 'application/json' }),
+      body: { cancel: async () => {} },
+      text: () =>
+        new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => {
+            const e = new Error('aborted');
+            e.name = 'AbortError';
+            reject(e);
+          });
+        }),
+    }));
+  // Raced, not just timed: if the fix regresses, forward() never settles at all, and
+  // a test that hangs forever is useless in CI — it must FAIL, and quickly.
+  const out = await Promise.race([
+    forward('{"jsonrpc":"2.0","id":4,"method":"tools/call"}', { ...BASE, fetch: stalledBody, timeoutMs: 1000 }),
+    new Promise((resolve) => setTimeout(() => resolve(['HUNG']), 4000)),
+  ]);
+  assert.notEqual(out[0], 'HUNG', 'the body read outlived the request timeout');
+  assert.match(JSON.parse(out[0]).error.message, /timed out/i);
+});
+
+test('retryDelayMs honours Retry-After seconds, an HTTP date, and falls back to backoff', () => {
+  // The previous retry test asserted nothing about the delay: deleting the whole
+  // Retry-After branch left it passing, just slower.
+  const withHeader = (h) => ({ headers: new Headers(h) });
+  const now = 1_000_000;
+  assert.equal(retryDelayMs(withHeader({ 'retry-after': '2' }), 1, now), 2000);
+  assert.equal(retryDelayMs(withHeader({ 'retry-after': '0' }), 1, now), 0);
+  // HTTP-date form — the branch nothing covered. opts.now is the seam that makes it
+  // deterministic.
+  const when = new Date(now + 5000).toUTCString();
+  const fromDate = retryDelayMs(withHeader({ 'retry-after': when }), 1, now);
+  assert.ok(Math.abs(fromDate - 5000) < 1000, `expected ~5000ms, got ${fromDate}`);
+  // Absent header: exponential backoff.
+  assert.equal(retryDelayMs(withHeader({}), 1, now), 400);
+  assert.equal(retryDelayMs(withHeader({}), 2, now), 800);
+  // Absurd values are capped.
+  assert.equal(retryDelayMs(withHeader({ 'retry-after': '99999' }), 1, now), 30_000);
+});
+
+test('a 502 replays tools/list but NOT tools/call', async () => {
+  // A gateway error may mean the request WAS delivered. Replaying a tools/call
+  // triple-meters the usage event; replaying initialize orphans sessions.
+  const attemptsFor = async (method) => {
+    let n = 0;
+    const fetchMock = async () => {
+      n++;
+      return mockResponse({ status: 502, body: 'bad gateway' });
+    };
+    await forward(`{"jsonrpc":"2.0","id":1,"method":"${method}"}`, { ...BASE, fetch: fetchMock });
+    return n;
+  };
+  assert.equal(await attemptsFor('tools/list'), 3, 'read-only, safe to replay');
+  assert.equal(await attemptsFor('tools/call'), 1, 'side-effecting, must not be replayed');
+  assert.equal(await attemptsFor('initialize'), 1, 'would orphan server-side sessions');
+});
+
+test('a 429 replays even a tools/call — nothing was executed', async () => {
+  let n = 0;
+  const fetchMock = async () => {
+    n++;
+    return n < 2
+      ? mockResponse({ status: 429, headers: { 'retry-after': '0' } })
+      : mockResponse({ body: '{"jsonrpc":"2.0","id":1,"result":{}}' });
+  };
+  await forward('{"jsonrpc":"2.0","id":1,"method":"tools/call"}', { ...BASE, fetch: fetchMock });
+  assert.equal(n, 2);
+});
+
+test('an SSE body with no data payload still answers a request that carried an id', async () => {
+  // Returning [] here strands the caller forever — worse than the corrupt frame the
+  // SSE branch was added to prevent, because the old code at least emitted something.
+  const cases = [
+    ': keep-alive\n\n: keep-alive\n\n', // comments only
+    '{"jsonrpc":"2.0","id":1,"result":{}}', // a proxy mislabelling plain JSON as SSE
+  ];
+  for (const body of cases) {
+    const fetchMock = async () => mockResponse({ body, headers: { 'content-type': 'text/event-stream' } });
+    const out = await forward('{"jsonrpc":"2.0","id":1,"method":"tools/call"}', { ...BASE, fetch: fetchMock });
+    assert.equal(out.length, 1, `expected a frame for body ${JSON.stringify(body)}`);
+    assert.ok(!out[0].includes('\n'));
+  }
+});
+
+test('parseSSE handles bare-CR terminators, which are legal SSE', () => {
+  assert.deepEqual(parseSSE('event: message\rdata: {"a":1}\r\r'), ['{"a":1}']);
+  assert.deepEqual(parseSSE('data: {"a":1}\r\n\r\ndata: {"b":2}\r\n\r\n'), ['{"a":1}', '{"b":2}']);
+});
+
+test('the negotiated protocol version is captured from an SSE initialize too', async () => {
+  // The SSE capture path was correct in code but no test used initialize over SSE,
+  // so deleting it changed nothing.
+  const fetchMock = async () =>
+    mockResponse({
+      headers: { 'content-type': 'text/event-stream' },
+      body: 'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}\n\n',
+    });
+  const session = {};
+  await forward('{"jsonrpc":"2.0","id":1,"method":"initialize"}', { ...BASE, fetch: fetchMock, session });
+  assert.equal(session.protocolVersion, '2025-11-25');
+});
+
+test('maxInflight: 0 does not wedge the loop', async () => {
+  // `?? MAX_INFLIGHT` accepts an explicit 0, and `while (0 >= 0) await race(empty)`
+  // never settles — a wedge inside the wedge-prevention code.
+  const fetchMock = async () => mockResponse({ body: '{"jsonrpc":"2.0","id":1,"result":{}}' });
+  const writes = [];
+  await run({
+    stdin: Readable.from(['{"jsonrpc":"2.0","id":1,"method":"ping"}\n']),
+    write: (s) => void writes.push(s),
+    fetch: fetchMock,
+    ...BASE,
+    maxInflight: 0,
+  });
+  assert.equal(writes.length, 1);
+});
+
+test('a write failure is surfaced, not swallowed', async () => {
+  const seen = [];
+  const fetchMock = async () => mockResponse({ body: '{"jsonrpc":"2.0","id":1,"result":{}}' });
+  await run({
+    stdin: Readable.from(['{"jsonrpc":"2.0","id":1,"method":"ping"}\n']),
+    write: () => {
+      throw new Error('EPIPE');
+    },
+    onError: (e) => seen.push(e),
+    fetch: fetchMock,
+    ...BASE,
+  });
+  assert.equal(seen.length, 1, 'an EPIPE on stdout must not vanish');
+  assert.match(String(seen[0].message ?? seen[0]), /EPIPE/);
+});
+
+test('SIGINT ends the session and exits — it must not hang', async () => {
+  // stdin.destroy() emits 'close', not 'end', and a readline async iterator does not
+  // terminate on close: run() never resolved, so the DELETE never fired — and
+  // registering the handler at all suppressed Node's default SIGINT exit, so Ctrl-C
+  // hung a process that used to die. No test covered the signal path, which is how
+  // it shipped.
+  const src = fileURLToPath(new URL('../src/bridge.js', import.meta.url));
+  const script = `
+    globalThis.fetch = async (url, init) => {
+      if (init.method === 'DELETE') {
+        process.stderr.write('DELETE-SENT\\n');
+        return { status: 204, ok: true, headers: new Headers(), text: async () => '', body: { cancel: async () => {} } };
+      }
+      return {
+        status: 200, ok: true,
+        headers: new Headers({ 'mcp-session-id': 'sess-1', 'content-type': 'application/json' }),
+        text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }),
+        body: { cancel: async () => {} },
+      };
+    };
+    const { main } = await import(${JSON.stringify(src)});
+    await main();
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    env: { PATH: process.env.PATH, NUMERATICA_API_KEY: 'k' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => (stderr += d));
+  child.stdout.on('data', () => {});
+  // Send one request and deliberately leave stdin OPEN, so only the signal can end it.
+  child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize"}\n');
+
+  await new Promise((r) => setTimeout(r, 500));
+  child.kill('SIGINT');
+
+  const exited = await Promise.race([
+    new Promise((r) => child.on('exit', (code) => r({ code }))),
+    new Promise((r) => setTimeout(() => r({ code: 'HUNG' }), 6000)),
+  ]);
+  if (exited.code === 'HUNG') child.kill('SIGKILL');
+
+  assert.notEqual(exited.code, 'HUNG', 'SIGINT must terminate the process');
+  assert.match(stderr, /DELETE-SENT/, 'the session must be terminated on the signal path');
+});
+
+test('the published config matches what CI actually exercises', () => {
+  // #16 changed config but asserted none of it, so "every finding has a test" was
+  // not true for the finding about tests.
+  const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
+  const ci = readFileSync(fileURLToPath(new URL('../.github/workflows/ci.yml', import.meta.url)), 'utf8');
+  const testTsconfig = readFileSync(fileURLToPath(new URL('./tsconfig.json', import.meta.url)), 'utf8');
+
+  assert.equal(pkg.engines.node, '>=20', 'Node 18 is EOL and was never exercised');
+  assert.match(pkg.scripts.prepublishOnly ?? '', /typecheck.*test|test.*typecheck/, 'publish must be gated on green');
+
+  const matrix = (ci.match(/node-version:\s*\[([^\]]+)\]/) ?? [])[1] ?? '';
+  const versions = matrix.split(',').map((v) => v.trim());
+  assert.ok(versions.includes('20'), 'the declared engines floor must be in the matrix');
+  for (const v of versions) {
+    assert.match(v, /^\d+$/, `unexpected matrix entry ${v}`);
+  }
+
+  // @types/node must track the runtimes actually typechecked, or the types describe
+  // a Node the code never runs on.
+  const typesMajor = Number((pkg.devDependencies['@types/node'].match(/(\d+)/) ?? [])[1]);
+  assert.ok(
+    typesMajor >= Number(pkg.engines.node.replace(/\D/g, '')),
+    `@types/node ${typesMajor} is older than the engines floor`,
+  );
+
+  // The root config covers bin+src; test/ has its own so prepublishOnly's typecheck
+  // actually looks at the test files too, which it previously never did.
+  assert.match(pkg.scripts.typecheck, /-p test/, 'typecheck must cover test/ as well as src/');
+  assert.match(testTsconfig, /"extends"/, 'the test config must inherit the real settings');
 });

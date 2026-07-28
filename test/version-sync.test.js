@@ -104,3 +104,20 @@ test('both install paths agree that the API key is required', () => {
     'the description must still explain that discovery is anonymous — that nuance now lives only here',
   );
 });
+
+test('the Smithery config schema binds the key to a header the API actually accepts', () => {
+  // This file is published to a third registry and referenced by nothing else in the
+  // suite. The binding is load-bearing: Smithery forwards the value VERBATIM, and the
+  // API rejects a bare token in Authorization ("missing API key") while accepting it
+  // in X-API-Key. Binding to Authorization would produce a dead first call for every
+  // Smithery user — the exact failure this schema exists to prevent.
+  const schema = read('smithery-config-schema.json');
+  assert.deepEqual(schema.required, ['apiKey'], 'the key must be collected at setup');
+  const apiKey = schema.properties.apiKey;
+  assert.equal(
+    apiKey['x-to'].header,
+    'X-API-Key',
+    'x-to cannot add a "Bearer " prefix, so Authorization would arrive malformed',
+  );
+  assert.match(apiKey.description, /get-key/, 'tell the user where to get one');
+});
