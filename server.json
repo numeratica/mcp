@@ -3,7 +3,7 @@
   "name": "com.numeratica/mcp",
   "title": "Numeratica — financial planning calculations",
   "description": "Deterministic US financial planning: retirement Monte Carlo, Roth conversion, RMD, tax, IRMAA, SS",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "websiteUrl": "https://docs.numeratica.com",
   "repository": {
     "url": "https://github.com/numeratica/mcp",
@@ -26,7 +26,7 @@
     {
       "registryType": "npm",
       "identifier": "@numeratica/mcp",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "transport": {
         "type": "stdio"
       },

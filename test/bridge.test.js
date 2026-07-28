@@ -4,7 +4,10 @@ import { Readable, Writable } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
-import { forward, run, loadConfig, validateConfig, parseSSE, endSession, makeWriter, retryDelayMs } from '../src/bridge.js';
+import {
+  forward, run, loadConfig, validateConfig, isDiscoveryOnly,
+  parseSSE, endSession, makeWriter, retryDelayMs,
+} from '../src/bridge.js';
 
 /**
  * Minimal stand-in for a fetch Response.
@@ -450,22 +453,46 @@ test('loadConfig: NUMERATICA_TIMEOUT_MS is honoured and validated', () => {
   assert.match(validateConfig(bad) ?? '', /NUMERATICA_TIMEOUT_MS/);
 });
 
-test('validateConfig reports a missing key without leaking anything', () => {
-  const msg = validateConfig(loadConfig([], {}));
-  assert.ok(msg && /NUMERATICA_API_KEY/.test(msg));
-  assert.match(msg, /docs\.numeratica\.com/);
+test('a missing key is NOT a config error — it selects discovery-only mode', () => {
+  const cfg = loadConfig([], {});
+  assert.equal(validateConfig(cfg), null, 'the bridge must start so the catalogue can be browsed');
+  assert.equal(isDiscoveryOnly(cfg), true);
+  assert.equal(isDiscoveryOnly(loadConfig([], { NUMERATICA_API_KEY: 'k' })), false);
 });
 
-test('the bin exits non-zero with a clear message and no stdout when the key is missing', () => {
+test('the bin starts without a key and says what mode it is in', () => {
   const bin = fileURLToPath(new URL('../bin/numeratica-mcp.js', import.meta.url));
   const r = spawnSync(process.execPath, [bin], {
     env: { PATH: process.env.PATH }, // no NUMERATICA_API_KEY
-    input: '',
+    input: '', // immediate EOF
     encoding: 'utf8',
   });
-  assert.equal(r.status, 1);
-  assert.equal(r.stdout, '');
-  assert.match(r.stderr, /NUMERATICA_API_KEY is required/);
+  assert.equal(r.status, 0, 'no key is a supported mode, not a failure');
+  assert.equal(r.stdout, '', 'stdout carries protocol only — never diagnostics');
+  assert.match(r.stderr, /DISCOVERY-ONLY/);
+  assert.match(r.stderr, /NUMERATICA_API_KEY/, 'say which variable to set');
+  assert.match(r.stderr, /docs\.numeratica\.com/, 'say where to get a key');
+});
+
+test('every OTHER config error is still fatal', () => {
+  const bin = fileURLToPath(new URL('../bin/numeratica-mcp.js', import.meta.url));
+  const runBin = (args, env) =>
+    spawnSync(process.execPath, [bin, ...args], {
+      env: { PATH: process.env.PATH, ...env },
+      input: '',
+      encoding: 'utf8',
+    });
+
+  // An unreadable --key-file is the important one: the user plainly MEANT to supply
+  // a key, so quietly dropping to discovery-only would hide a typo'd path behind an
+  // integration that lists every tool and runs none of them.
+  const keyFile = runBin(['--key-file', '/definitely/not/here'], {});
+  assert.equal(keyFile.status, 1, 'a key-file that cannot be read must not degrade to keyless');
+  assert.match(keyFile.stderr, /could not read --key-file/);
+  assert.equal(keyFile.stdout, '');
+
+  assert.equal(runBin(['--kye', 'typo'], {}).status, 1, 'unknown flag');
+  assert.equal(runBin([], { NUMERATICA_TIMEOUT_MS: 'soon' }).status, 1, 'unparseable timeout');
 });
 
 test('a large final response survives shutdown intact (writer drain, end to end)', () => {
@@ -718,4 +745,97 @@ test('the published config matches what CI actually exercises', () => {
   // actually looks at the test files too, which it previously never did.
   assert.match(pkg.scripts.typecheck, /-p test/, 'typecheck must cover test/ as well as src/');
   assert.match(testTsconfig, /"extends"/, 'the test config must inherit the real settings');
+});
+
+// --- discovery-only mode (no API key) ----------------------------------------
+
+const NO_KEY = { baseUrl: 'https://api.example.com' }; // note: no apiKey
+
+test('keyless: tools/list is forwarded with NO Authorization header at all', async () => {
+  let seenInit = /** @type {any} */ (null);
+  const fetchMock = async (_url, init) => {
+    seenInit = init;
+    return mockResponse({ body: '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}' });
+  };
+  const out = await forward('{"jsonrpc":"2.0","id":1,"method":"tools/list"}', { ...NO_KEY, fetch: fetchMock });
+
+  assert.equal(out.length, 1, 'discovery must work without a key');
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(seenInit.headers, 'Authorization'),
+    'the property must be ABSENT, not empty — the server treats any value as a credential',
+  );
+  // The rest of the contract is unchanged.
+  assert.equal(seenInit.headers.Accept, 'application/json, text/event-stream');
+});
+
+test('keyless: no header anywhere contains the string "undefined"', async () => {
+  // `Bearer ${undefined}` interpolates to "Bearer undefined" — a credential-shaped
+  // value the server would look up and reject, turning "no key" into "bad key" and
+  // destroying anonymous discovery. Checking for an empty value would not catch it.
+  let seenInit = /** @type {any} */ (null);
+  const fetchMock = async (_url, init) => {
+    seenInit = init;
+    return mockResponse({ body: '{"jsonrpc":"2.0","id":1,"result":{}}' });
+  };
+  await forward('{"jsonrpc":"2.0","id":1,"method":"initialize"}', { ...NO_KEY, fetch: fetchMock });
+  for (const [name, value] of Object.entries(seenInit.headers)) {
+    assert.doesNotMatch(String(value), /undefined/i, `header ${name} leaked an undefined`);
+  }
+});
+
+test('keyless: tools/call makes ZERO upstream requests and says where to get a key', async () => {
+  let calls = 0;
+  const fetchMock = async () => {
+    calls++;
+    return mockResponse({});
+  };
+  const out = await forward('{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"tvm"}}', {
+    ...NO_KEY,
+    fetch: fetchMock,
+  });
+
+  assert.equal(calls, 0, 'no point spending a round trip to be told what we already know');
+  const err = JSON.parse(out[0]).error;
+  assert.equal(JSON.parse(out[0]).id, 8, 'the id must still correlate');
+  assert.match(err.message, /NUMERATICA_API_KEY/, 'name the variable to set');
+  assert.match(err.message, /https:\/\/docs\.numeratica\.com/, 'and where to get a key');
+});
+
+test('keyless: a notification still produces no output', async () => {
+  const fetchMock = async () => mockResponse({ status: 202 });
+  const out = await forward('{"jsonrpc":"2.0","method":"notifications/initialized"}', { ...NO_KEY, fetch: fetchMock });
+  assert.deepEqual(out, []);
+});
+
+test('keyless: a tools/call notification produces no output either', async () => {
+  // Belt and braces: the short-circuit must not invent a frame for a message that
+  // had no id, which would corrupt the stream.
+  let calls = 0;
+  const fetchMock = async () => {
+    calls++;
+    return mockResponse({ status: 202 });
+  };
+  const out = await forward('{"jsonrpc":"2.0","method":"tools/call","params":{"name":"tvm"}}', {
+    ...NO_KEY,
+    fetch: fetchMock,
+  });
+  assert.deepEqual(out, []);
+  assert.equal(calls, 0);
+});
+
+test('with a key: the request is byte-identical to before this change', async () => {
+  let seenInit = /** @type {any} */ (null);
+  const fetchMock = async (_url, init) => {
+    seenInit = init;
+    return mockResponse({ body: '{"jsonrpc":"2.0","id":1,"result":{}}' });
+  };
+  const req = '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"tvm"}}';
+  const out = await forward(req, { ...BASE, fetch: fetchMock });
+
+  assert.equal(seenInit.headers.Authorization, 'Bearer sek_test');
+  assert.equal(seenInit.headers['Content-Type'], 'application/json');
+  assert.equal(seenInit.headers.Accept, 'application/json, text/event-stream');
+  assert.equal(seenInit.body, req, 'still forwarded verbatim');
+  assert.equal(out.length, 1);
+  assert.match(out[0], /"result"/, 'a keyed tools/call must reach the server, not the short-circuit');
 });

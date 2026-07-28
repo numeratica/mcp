@@ -37,6 +37,11 @@ const REPLAY_SAFE_METHODS = new Set(['tools/list', 'ping', 'resources/list', 'pr
 const MAX_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 30_000;
 
+// JSON-RPC reserves -32000..-32099 for implementation-defined errors. A distinct
+// code lets a client separate "you have not configured a key" from "the transport
+// failed", which are the same -32000 otherwise and want different remedies.
+const MISSING_KEY_CODE = -32001;
+
 // Sent on requests AFTER initialize, until the negotiated version is known. Not on
 // initialize itself — see buildHeaders for why "a version beats no version" is
 // exactly backwards for that one request.
@@ -115,14 +120,26 @@ export function loadConfig(argv, env, readFile = (p) => readFileSync(p, 'utf8'))
  * @returns {string|null}
  */
 export function validateConfig(config) {
+  // A --key-file we could not read stays FATAL. The user plainly intended to supply
+  // a key; silently demoting that to discovery-only mode would hide a typo'd path
+  // behind an integration that lists every tool and refuses to run any of them.
   if (config.configError) return config.configError;
   if (config.unknownFlags?.length) {
     return `unknown option ${config.unknownFlags[0]}. Supported: --key, --key=, --key-file`;
   }
-  if (!config.apiKey) {
-    return 'NUMERATICA_API_KEY is required. Get a free key at https://docs.numeratica.com';
-  }
+  // A MISSING key is not an error: the bridge starts in discovery-only mode so a
+  // client can enumerate the catalogue before anyone signs up. The hosted endpoint
+  // already answers initialize/tools/list/ping anonymously; exiting here meant that
+  // only crawlers ever saw the benefit and a human evaluating us never did.
   return null;
+}
+
+/**
+ * True when the bridge is running without a key: discovery works, calls do not.
+ * @param {Config} config
+ */
+export function isDiscoveryOnly(config) {
+  return !config.apiKey;
 }
 
 /**
@@ -144,7 +161,7 @@ function jsonRpcError(id, code, message) {
  * compliant server is entitled to answer 406 otherwise. Sending only
  * application/json worked solely because our own server is lenient.
  *
- * @param {{ apiKey: string }} opts
+ * @param {{ apiKey?: string }} opts
  * @param {Session} session
  * @param {string} [method]
  * @returns {Record<string,string>}
@@ -152,10 +169,14 @@ function jsonRpcError(id, code, message) {
 function buildHeaders(opts, session, method) {
   /** @type {Record<string,string>} */
   const headers = {
-    Authorization: `Bearer ${opts.apiKey}`,
     'Content-Type': 'application/json',
     Accept: 'application/json, text/event-stream',
   };
+  // OMITTED, not blank: `Bearer ${undefined}` interpolates to the literal string
+  // "Bearer undefined", which is a credential-shaped value the server would try to
+  // look up and reject — turning "no key" into "bad key" and losing anonymous
+  // discovery entirely.
+  if (opts.apiKey) headers.Authorization = `Bearer ${opts.apiKey}`;
   // The spec puts MCP-Protocol-Version on requests SUBSEQUENT to initialization.
   // Sending a guess on `initialize` itself is not merely premature, it is worse
   // than sending nothing: a server that speaks only 2025-03-26 must answer 400 for
@@ -302,7 +323,7 @@ function captureProtocolVersion(text, method, session) {
  * only when the server answered with a multi-frame SSE stream.
  *
  * @param {string} line
- * @param {{ baseUrl: string, apiKey: string, fetch: typeof globalThis.fetch, timeoutMs?: number, session?: Session, now?: () => number }} opts
+ * @param {{ baseUrl: string, apiKey?: string, fetch: typeof globalThis.fetch, timeoutMs?: number, session?: Session, now?: () => number }} opts
  * @returns {Promise<string[]>}
  */
 export async function forward(line, opts) {
@@ -341,6 +362,26 @@ export async function forward(line, opts) {
   // produced an error with a null id by accident; say so on purpose instead.
   if (isBatch) {
     return [jsonRpcError(null, -32600, 'Invalid Request: JSON-RPC batching is not supported; send one message per line')];
+  }
+
+  // Short-circuit BEFORE the round trip. The server's own 401 is correct but says
+  // nothing about where to get a key — and the person hitting this is the entire
+  // reason keyless mode exists: someone evaluating the integration who has just
+  // watched 76 tools appear. This message is the one that reaches them, because the
+  // model relays a tool error into the conversation, whereas stderr is invisible in
+  // most clients.
+  if (method === 'tools/call' && !opts.apiKey) {
+    if (isNotification) return [];
+    return [
+      jsonRpcError(
+        id,
+        MISSING_KEY_CODE,
+        'This tool needs a Numeratica API key. Get a free one at ' +
+          'https://docs.numeratica.com/get-key, then set NUMERATICA_API_KEY in your MCP ' +
+          'client config and restart. Browsing the tool catalogue works without a key; ' +
+          'running a calculation does not.',
+      ),
+    ];
   }
 
   const timedOut = () =>
@@ -451,7 +492,7 @@ export async function forward(line, opts) {
  * a server that does not support explicit termination, are both fine. Without it
  * server-side session state lives until it times out, and `npx` launches a fresh
  * bridge per client restart.
- * @param {{ baseUrl: string, apiKey: string, fetch: typeof globalThis.fetch }} opts
+ * @param {{ baseUrl: string, apiKey?: string, fetch: typeof globalThis.fetch }} opts
  * @param {Session} session
  */
 export async function endSession(opts, session) {
@@ -483,7 +524,7 @@ export async function endSession(opts, session) {
  * back. Awaiting each in turn meant a 40-second Monte Carlo delayed a 50 ms
  * bracket lookup behind it by the full 40 seconds.
  *
- * @param {{ stdin: NodeJS.ReadableStream, write: (s: string) => void|Promise<void>, fetch: typeof globalThis.fetch, baseUrl: string, apiKey: string, timeoutMs?: number, session?: Session, maxInflight?: number, onError?: (e: unknown) => void }} opts
+ * @param {{ stdin: NodeJS.ReadableStream, write: (s: string) => void|Promise<void>, fetch: typeof globalThis.fetch, baseUrl: string, apiKey?: string, timeoutMs?: number, session?: Session, maxInflight?: number, onError?: (e: unknown) => void }} opts
  * @returns {Promise<Session>}
  */
 export async function run(opts) {
@@ -559,6 +600,18 @@ export async function main() {
     return;
   }
 
+  // Discovery-only mode is a real, useful state — but an integration that lists 76
+  // tools and fails every call reads as broken unless it says otherwise. Say it
+  // plainly, and say what to do. (stderr is safe: the stdio transport reserves only
+  // stdout, so no client parses this as protocol.)
+  if (isDiscoveryOnly(config)) {
+    process.stderr.write(
+      'numeratica-mcp: no API key set — running in DISCOVERY-ONLY mode. ' +
+        'Tool listing works; running a calculation does not. ' +
+        'Set NUMERATICA_API_KEY (free key: https://docs.numeratica.com/get-key) to enable calls.\n',
+    );
+  }
+
   // The README documents the hazard, but a warning where it actually happens is
   // what reaches someone who copied a config from a blog post: a key in argv is
   // readable by `ps` for every user on the box and lands in shell history.
@@ -575,7 +628,7 @@ export async function main() {
     write: makeWriter(process.stdout),
     fetch: globalThis.fetch,
     baseUrl: config.baseUrl,
-    apiKey: /** @type {string} */ (config.apiKey),
+    apiKey: config.apiKey,
     timeoutMs: config.timeoutMs,
     session,
   };
